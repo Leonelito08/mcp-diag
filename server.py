@@ -1,5 +1,7 @@
 """
-MCP de diagnóstico READ-ONLY para el server Hetzner (Chatwoot).
+MCP de diagnóstico READ-ONLY para el server Hetzner (Chatwoot en Docker Swarm).
+v1.1 — soporte Swarm: allowlist por SERVICIO (nombres estables), logs vía
+`docker service logs`, resolución dinámica de tasks para exec.
 
 Diseño de seguridad (no negociable):
   1. Cada tool ejecuta comandos FIJOS como lista argv (nunca shell=True,
@@ -9,7 +11,7 @@ Diseño de seguridad (no negociable):
   3. Todo tiene timeout y la salida se trunca.
   4. El endpoint vive detrás de un path secreto (la URL es la credencial)
      y el proceso escucha solo en 127.0.0.1 — expuesto vía Cloudflare
-     Tunnel o Caddy con HTTPS.
+     Tunnel con HTTPS.
 
 Extender = escribir una función con argv fijo + @mcp.tool() y reiniciar
 el servicio. Ver README, sección "Cómo agregar herramientas".
@@ -26,20 +28,22 @@ from fastmcp import FastMCP
 # ----------------------------------------------------------------------
 SECRET = os.environ.get("MCP_SECRET", "")
 PORT = int(os.environ.get("MCP_PORT", "8321"))
-CHATWOOT_LOCAL_URL = os.environ.get("CHATWOOT_LOCAL_URL", "http://127.0.0.1:3000")
-REDIS_CONTAINER = os.environ.get("REDIS_CONTAINER", "").strip()
-ALLOWED_CONTAINERS = {
-    c.strip() for c in os.environ.get("ALLOWED_CONTAINERS", "").split(",") if c.strip()
+CHATWOOT_LOCAL_URL = os.environ.get("CHATWOOT_LOCAL_URL", "http://127.0.0.1:80")
+CHATWOOT_HOST_HEADER = os.environ.get("CHATWOOT_HOST_HEADER", "").strip()
+REDIS_SERVICE = os.environ.get("REDIS_SERVICE", "").strip()
+ALLOWED_SERVICES = {
+    s.strip() for s in os.environ.get("ALLOWED_SERVICES", "").split(",") if s.strip()
 }
 
 MAX_OUTPUT_CHARS = 14_000
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")  # nombres docker/redis válidos
+HEX_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
 
 mcp = FastMCP("Hetzner Chatwoot — diagnóstico read-only")
 
 
 # ----------------------------------------------------------------------
-# Helper único de ejecución
+# Helpers
 # ----------------------------------------------------------------------
 def run(argv: list[str], timeout: int = 15) -> str:
     """Ejecuta un comando fijo (argv), con timeout y salida truncada."""
@@ -64,6 +68,16 @@ def _clamp(n, lo: int, hi: int, default: int) -> int:
         return max(lo, min(int(n), hi))
     except (TypeError, ValueError):
         return default
+
+
+def _resolve_task(service: str) -> str | None:
+    """Devuelve el container ID de la task corriendo de un servicio swarm.
+    El nombre del servicio ya viene validado contra allowlist/regex."""
+    out = run(["docker", "ps", "-q", "--filter", f"name={service}"], timeout=10)
+    for line in out.splitlines():
+        if HEX_ID_RE.match(line.strip()):
+            return line.strip()
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -102,10 +116,16 @@ def oom_check(lineas: int = 40) -> str:
 
 @mcp.tool()
 def docker_status() -> str:
-    """Estado de todos los containers (incl. detenidos) + consumo actual de CPU/RAM."""
+    """Servicios swarm con sus réplicas (0/1 = servicio caído), containers y consumo.
+    Primera herramienta a mirar cuando 'el CRM se cae'."""
+    svc = run(
+        ["docker", "service", "ls", "--format",
+         "table {{.Name}}\t{{.Replicas}}\t{{.Image}}"],
+        timeout=15,
+    )
     ps = run(
         ["docker", "ps", "-a", "--format",
-         "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}\t{{.Image}}"],
+         "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"],
         timeout=15,
     )
     stats = run(
@@ -113,7 +133,8 @@ def docker_status() -> str:
          "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}"],
         timeout=30,
     )
-    return f"== docker ps -a ==\n{ps}\n\n== docker stats ==\n{stats}"
+    return (f"== docker service ls ==\n{svc}\n\n"
+            f"== docker ps -a ==\n{ps}\n\n== docker stats ==\n{stats}")
 
 
 @mcp.tool()
@@ -123,26 +144,33 @@ def docker_disk() -> str:
 
 
 @mcp.tool()
-def container_logs(container: str, lineas: int = 100) -> str:
-    """Últimas N líneas de log de un container de la allowlist (ALLOWED_CONTAINERS en .env)."""
-    if not ALLOWED_CONTAINERS:
-        return ("ALLOWED_CONTAINERS está vacío en .env. "
-                "Corré docker_status para ver los nombres reales y agregalos.")
-    if container not in ALLOWED_CONTAINERS or not NAME_RE.match(container):
-        return f"Container fuera de la allowlist. Permitidos: {sorted(ALLOWED_CONTAINERS)}"
+def service_logs(service: str, lineas: int = 100) -> str:
+    """Últimas N líneas de log de un servicio swarm de la allowlist
+    (ALLOWED_SERVICES en .env). Funciona aunque la task se haya reiniciado."""
+    if not ALLOWED_SERVICES:
+        return ("ALLOWED_SERVICES está vacío en .env. "
+                "Corré docker_status para ver los servicios y agregalos.")
+    if service not in ALLOWED_SERVICES or not NAME_RE.match(service):
+        return f"Servicio fuera de la allowlist. Permitidos: {sorted(ALLOWED_SERVICES)}"
     lineas = _clamp(lineas, 1, 500, 100)
-    return run(["docker", "logs", "--tail", str(lineas), container], timeout=25)
+    return run(
+        ["docker", "service", "logs", "--no-task-ids", "--tail", str(lineas), service],
+        timeout=30,
+    )
 
 
 @mcp.tool()
 def sidekiq_queues() -> str:
     """Tamaño de las colas Sidekiq en Redis (pendientes por cola + retry/schedule/dead).
     Si Sidekiq murió, acá se ven colas creciendo — y Chatwoot deja de despachar webhooks."""
-    if not REDIS_CONTAINER:
-        return "Configurá REDIS_CONTAINER en .env (el nombre del container de Redis)."
-    if not NAME_RE.match(REDIS_CONTAINER):
-        return "REDIS_CONTAINER tiene un nombre inválido."
-    base = ["docker", "exec", REDIS_CONTAINER, "redis-cli"]
+    if not REDIS_SERVICE:
+        return "Configurá REDIS_SERVICE en .env (el nombre del servicio de Redis)."
+    if not NAME_RE.match(REDIS_SERVICE):
+        return "REDIS_SERVICE tiene un nombre inválido."
+    cid = _resolve_task(REDIS_SERVICE)
+    if not cid:
+        return f"No hay ninguna task corriendo del servicio {REDIS_SERVICE} — ¿Redis caído?"
+    base = ["docker", "exec", cid, "redis-cli"]
 
     ping = run(base + ["ping"], timeout=10)
     if "PONG" not in ping:
@@ -160,14 +188,15 @@ def sidekiq_queues() -> str:
 
 @mcp.tool()
 def chatwoot_health() -> str:
-    """Chequea que Chatwoot responda EN LOCAL (sin pasar por Cloudflare/DNS).
-    Si esto responde 200 pero el sitio público no, el problema está afuera del server."""
-    return run(
-        ["curl", "-s", "-S", "-o", "/dev/null", "-m", "10",
-         "-w", "HTTP %{http_code} en %{time_total}s (conexión %{time_connect}s)",
-         CHATWOOT_LOCAL_URL],
-        timeout=15,
-    )
+    """Chequea la cadena Traefik → Chatwoot desde el propio server (sin salir a internet).
+    Lectura: 200/30x = viva | 502/504 = Traefik vivo pero app caída |
+    timeout o connection refused = Traefik caído."""
+    argv = ["curl", "-s", "-S", "-o", "/dev/null", "-m", "10",
+            "-w", "HTTP %{http_code} en %{time_total}s (conexión %{time_connect}s)"]
+    if CHATWOOT_HOST_HEADER:
+        argv += ["-H", f"Host: {CHATWOOT_HOST_HEADER}"]
+    argv += [CHATWOOT_LOCAL_URL]
+    return run(argv, timeout=15)
 
 
 # ----------------------------------------------------------------------
@@ -179,6 +208,6 @@ if __name__ == "__main__":
             "MCP_SECRET faltante o demasiado corto (mínimo 32 caracteres). "
             "Generalo con: openssl rand -hex 32"
         )
-    # Escucha SOLO en localhost; lo expone el túnel/proxy con HTTPS.
+    # Escucha SOLO en localhost; lo expone el túnel con HTTPS.
     # La URL final del conector es: https://<tu-hostname>/<MCP_SECRET>/mcp
     mcp.run(transport="http", host="127.0.0.1", port=PORT, path=f"/{SECRET}/mcp")
