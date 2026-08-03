@@ -1,22 +1,19 @@
 """
 MCP de diagnóstico READ-ONLY para el server Hetzner (Chatwoot en Docker Swarm).
-v1.2 — modo stateless + respuestas JSON planas (compatibilidad con el
-conector personalizado de claude.ai a través de Cloudflare Tunnel).
-v1.1 — soporte Swarm: allowlist por SERVICIO (nombres estables), logs vía
-`docker service logs`, resolución dinámica de tasks para exec.
+v1.3 — medición de storage: postgres_databases + chatwoot_storage_report
+(consultas SELECT fijas, auditables acá; el modelo no puede enviar SQL propio).
+v1.2 — modo stateless + respuestas JSON planas (compatibilidad claude.ai).
+v1.1 — soporte Swarm: allowlist por SERVICIO, service logs, resolución de tasks.
 
 Diseño de seguridad (no negociable):
   1. Cada tool ejecuta comandos FIJOS como lista argv (nunca shell=True,
-     nunca texto del modelo interpolado en un comando).
+     nunca texto del modelo interpolado en un comando o en SQL).
   2. Los únicos parámetros aceptados son números acotados o nombres
      validados contra allowlist + regex.
   3. Todo tiene timeout y la salida se trunca.
   4. El endpoint vive detrás de un path secreto (la URL es la credencial)
      y el proceso escucha solo en 127.0.0.1 — expuesto vía Cloudflare
      Tunnel con HTTPS.
-
-Extender = escribir una función con argv fijo + @mcp.tool() y reiniciar
-el servicio. Ver README, sección "Cómo agregar herramientas".
 """
 
 import os
@@ -33,12 +30,13 @@ PORT = int(os.environ.get("MCP_PORT", "8321"))
 CHATWOOT_LOCAL_URL = os.environ.get("CHATWOOT_LOCAL_URL", "http://127.0.0.1:80")
 CHATWOOT_HOST_HEADER = os.environ.get("CHATWOOT_HOST_HEADER", "").strip()
 REDIS_SERVICE = os.environ.get("REDIS_SERVICE", "").strip()
+PG_SERVICE = os.environ.get("PG_SERVICE", "pgvector_pgvector").strip()
 ALLOWED_SERVICES = {
     s.strip() for s in os.environ.get("ALLOWED_SERVICES", "").split(",") if s.strip()
 }
 
 MAX_OUTPUT_CHARS = 14_000
-NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")  # nombres docker/redis válidos
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 HEX_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
 
 mcp = FastMCP("Hetzner Chatwoot — diagnóstico read-only")
@@ -73,8 +71,7 @@ def _clamp(n, lo: int, hi: int, default: int) -> int:
 
 
 def _resolve_task(service: str) -> str | None:
-    """Devuelve el container ID de la task corriendo de un servicio swarm.
-    El nombre del servicio ya viene validado contra allowlist/regex."""
+    """Container ID de la task corriendo de un servicio swarm (nombre ya validado)."""
     out = run(["docker", "ps", "-q", "--filter", f"name={service}"], timeout=10)
     for line in out.splitlines():
         if HEX_ID_RE.match(line.strip()):
@@ -82,8 +79,23 @@ def _resolve_task(service: str) -> str | None:
     return None
 
 
+def _psql(db: str, sql: str, timeout: int = 45) -> str:
+    """Ejecuta una consulta FIJA (definida en este archivo) vía psql dentro del
+    container de Postgres. `db` viene validado contra NAME_RE por el caller."""
+    if not NAME_RE.match(PG_SERVICE):
+        return "PG_SERVICE inválido en .env."
+    cid = _resolve_task(PG_SERVICE)
+    if not cid:
+        return f"No hay task corriendo del servicio {PG_SERVICE}."
+    return run(
+        ["docker", "exec", cid, "psql", "-U", "postgres", "-d", db,
+         "-v", "ON_ERROR_STOP=1", "-P", "pager=off", "-c", sql],
+        timeout=timeout,
+    )
+
+
 # ----------------------------------------------------------------------
-# Tools
+# Tools — sistema y docker
 # ----------------------------------------------------------------------
 @mcp.tool()
 def system_stats() -> str:
@@ -105,8 +117,7 @@ def top_mem() -> str:
 
 @mcp.tool()
 def oom_check(lineas: int = 40) -> str:
-    """Eventos del OOM-killer en el log del kernel (journalctl -k).
-    Si aparece 'Killed process', el kernel estuvo matando procesos por falta de RAM."""
+    """Eventos del OOM-killer en el log del kernel (journalctl -k, boot actual)."""
     lineas = _clamp(lineas, 1, 200, 40)
     out = run(["journalctl", "-k", "--no-pager", "-n", "5000"], timeout=25)
     claves = ("out of memory", "oom", "killed process")
@@ -118,8 +129,7 @@ def oom_check(lineas: int = 40) -> str:
 
 @mcp.tool()
 def docker_status() -> str:
-    """Servicios swarm con sus réplicas (0/1 = servicio caído), containers y consumo.
-    Primera herramienta a mirar cuando 'el CRM se cae'."""
+    """Servicios swarm con réplicas (0/1 = caído), containers y consumo."""
     svc = run(
         ["docker", "service", "ls", "--format",
          "table {{.Name}}\t{{.Replicas}}\t{{.Image}}"],
@@ -147,11 +157,9 @@ def docker_disk() -> str:
 
 @mcp.tool()
 def service_logs(service: str, lineas: int = 100) -> str:
-    """Últimas N líneas de log de un servicio swarm de la allowlist
-    (ALLOWED_SERVICES en .env). Funciona aunque la task se haya reiniciado."""
+    """Últimas N líneas de log de un servicio swarm de la allowlist."""
     if not ALLOWED_SERVICES:
-        return ("ALLOWED_SERVICES está vacío en .env. "
-                "Corré docker_status para ver los servicios y agregalos.")
+        return "ALLOWED_SERVICES está vacío en .env."
     if service not in ALLOWED_SERVICES or not NAME_RE.match(service):
         return f"Servicio fuera de la allowlist. Permitidos: {sorted(ALLOWED_SERVICES)}"
     lineas = _clamp(lineas, 1, 500, 100)
@@ -163,10 +171,9 @@ def service_logs(service: str, lineas: int = 100) -> str:
 
 @mcp.tool()
 def sidekiq_queues() -> str:
-    """Tamaño de las colas Sidekiq en Redis (pendientes por cola + retry/schedule/dead).
-    Si Sidekiq murió, acá se ven colas creciendo — y Chatwoot deja de despachar webhooks."""
+    """Colas Sidekiq en Redis (pendientes por cola + retry/schedule/dead)."""
     if not REDIS_SERVICE:
-        return "Configurá REDIS_SERVICE en .env (el nombre del servicio de Redis)."
+        return "Configurá REDIS_SERVICE en .env."
     if not NAME_RE.match(REDIS_SERVICE):
         return "REDIS_SERVICE tiene un nombre inválido."
     cid = _resolve_task(REDIS_SERVICE)
@@ -190,15 +197,96 @@ def sidekiq_queues() -> str:
 
 @mcp.tool()
 def chatwoot_health() -> str:
-    """Chequea la cadena Traefik → Chatwoot desde el propio server (sin salir a internet).
-    Lectura: 200/30x = viva | 502/504 = Traefik vivo pero app caída |
-    timeout o connection refused = Traefik caído."""
+    """Cadena Traefik → Chatwoot desde el propio server (sin salir a internet)."""
     argv = ["curl", "-s", "-S", "-o", "/dev/null", "-m", "10",
             "-w", "HTTP %{http_code} en %{time_total}s (conexión %{time_connect}s)"]
     if CHATWOOT_HOST_HEADER:
         argv += ["-H", f"Host: {CHATWOOT_HOST_HEADER}"]
     argv += [CHATWOOT_LOCAL_URL]
     return run(argv, timeout=15)
+
+
+# ----------------------------------------------------------------------
+# Tools — medición de storage (v1.3, consultas SELECT fijas)
+# ----------------------------------------------------------------------
+@mcp.tool()
+def postgres_databases() -> str:
+    """Bases de datos del Postgres (servicio PG_SERVICE) con su tamaño."""
+    return _psql(
+        "postgres",
+        "SELECT datname AS base, pg_size_pretty(pg_database_size(datname)) AS tamaño "
+        "FROM pg_database WHERE NOT datistemplate "
+        "ORDER BY pg_database_size(datname) DESC;",
+    )
+
+
+@mcp.tool()
+def chatwoot_storage_report(db: str) -> str:
+    """Medición READ-ONLY del storage de Chatwoot en la base indicada:
+    tamaño por tipo de registro, top duplicados, GB recuperables por dedup
+    (total y solo-enviados), y crecimiento mensual orgánico vs total.
+    Todas las consultas son SELECT fijas definidas en este archivo."""
+    if not NAME_RE.match(db):
+        return "Nombre de base inválido."
+
+    q_tipos = (
+        "SELECT att.record_type AS tipo, count(*) AS archivos, "
+        "pg_size_pretty(sum(b.byte_size)::bigint) AS total "
+        "FROM active_storage_blobs b "
+        "JOIN active_storage_attachments att ON att.blob_id = b.id "
+        "GROUP BY 1 ORDER BY sum(b.byte_size) DESC;"
+    )
+    q_top_dup = (
+        "SELECT min(b.filename) AS ejemplo, pg_size_pretty(b.byte_size::bigint) AS tam_unit, "
+        "count(*) AS copias, pg_size_pretty((b.byte_size * count(*))::bigint) AS ocupa "
+        "FROM active_storage_blobs b "
+        "GROUP BY b.checksum, b.byte_size HAVING count(*) > 1 "
+        "ORDER BY b.byte_size * count(*) DESC LIMIT 15;"
+    )
+    q_dedup_total = (
+        "SELECT pg_size_pretty(COALESCE(sum(byte_size * (cnt - 1)), 0)::bigint) AS recuperable_dedup "
+        "FROM (SELECT byte_size, count(*) AS cnt FROM active_storage_blobs "
+        "GROUP BY checksum, byte_size HAVING count(*) > 1) t;"
+    )
+    q_env_rec = (
+        "SELECT CASE m.message_type WHEN 0 THEN 'recibido' WHEN 1 THEN 'enviado' "
+        "ELSE 'otro' END AS direccion, count(*) AS archivos, "
+        "pg_size_pretty(sum(b.byte_size)::bigint) AS total "
+        "FROM active_storage_blobs b "
+        "JOIN active_storage_attachments att ON att.blob_id = b.id AND att.record_type = 'Attachment' "
+        "JOIN attachments a ON a.id = att.record_id "
+        "JOIN messages m ON m.id = a.message_id "
+        "GROUP BY 1 ORDER BY sum(b.byte_size) DESC;"
+    )
+    q_dedup_enviados = (
+        "SELECT pg_size_pretty(COALESCE(sum(t.byte_size * (t.cnt - 1)), 0)::bigint) AS recuperable_dedup_enviados "
+        "FROM (SELECT b.checksum, b.byte_size, count(*) AS cnt "
+        "FROM active_storage_blobs b "
+        "JOIN active_storage_attachments att ON att.blob_id = b.id AND att.record_type = 'Attachment' "
+        "JOIN attachments a ON a.id = att.record_id "
+        "JOIN messages m ON m.id = a.message_id AND m.message_type = 1 "
+        "GROUP BY 1, 2 HAVING count(*) > 1) t;"
+    )
+    q_mensual = (
+        "WITH dup AS (SELECT checksum FROM active_storage_blobs "
+        "GROUP BY checksum HAVING count(*) > 1) "
+        "SELECT to_char(b.created_at, 'YYYY-MM') AS mes, "
+        "pg_size_pretty(COALESCE(sum(b.byte_size) FILTER "
+        "(WHERE b.checksum NOT IN (SELECT checksum FROM dup)), 0)::bigint) AS organico, "
+        "pg_size_pretty(sum(b.byte_size)::bigint) AS total "
+        "FROM active_storage_blobs b "
+        "GROUP BY 1 ORDER BY 1 DESC LIMIT 12;"
+    )
+
+    secciones = [
+        ("== Tamaño por tipo de registro ==", q_tipos),
+        ("== Top 15 archivos duplicados (por espacio ocupado) ==", q_top_dup),
+        ("== Recuperable con dedup (todo) ==", q_dedup_total),
+        ("== Enviado vs recibido (adjuntos de mensajes) ==", q_env_rec),
+        ("== Recuperable con dedup SOLO enviados ==", q_dedup_enviados),
+        ("== Crecimiento mensual: orgánico (únicos) vs total ==", q_mensual),
+    ]
+    return "\n\n".join(f"{t}\n{_psql(db, q)}" for t, q in secciones)
 
 
 # ----------------------------------------------------------------------
@@ -210,11 +298,6 @@ if __name__ == "__main__":
             "MCP_SECRET faltante o demasiado corto (mínimo 32 caracteres). "
             "Generalo con: openssl rand -hex 32"
         )
-    # Escucha SOLO en localhost; lo expone el túnel con HTTPS.
-    # stateless + JSON plano: cada request es autocontenida (sin session
-    # affinity) y las respuestas a POST son application/json en vez de SSE —
-    # el modo más compatible con el conector personalizado de claude.ai.
-    # La URL final del conector es: https://<tu-hostname>/<MCP_SECRET>/mcp
     mcp.run(
         transport="http",
         host="127.0.0.1",
