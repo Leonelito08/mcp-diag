@@ -1,0 +1,26 @@
+[Unit]
+Description=MCP diagnostico read-only (Chatwoot/Hetzner)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mcpdiag
+# docker: para docker ps/logs/exec | systemd-journal: para journalctl -k
+SupplementaryGroups=docker systemd-journal
+EnvironmentFile=/opt/mcp-diag/.env
+WorkingDirectory=/opt/mcp-diag
+ExecStart=/opt/mcp-diag/venv/bin/python /opt/mcp-diag/server.py
+Restart=always
+RestartSec=3
+
+# Hardening: el proceso no puede escribir el sistema ni escalar privilegios.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
