@@ -1,5 +1,7 @@
 """
 MCP de diagnóstico READ-ONLY para el server Hetzner (Chatwoot en Docker Swarm).
+v1.2 — modo stateless + respuestas JSON planas (compatibilidad con el
+conector personalizado de claude.ai a través de Cloudflare Tunnel).
 v1.1 — soporte Swarm: allowlist por SERVICIO (nombres estables), logs vía
 `docker service logs`, resolución dinámica de tasks para exec.
 
@@ -209,5 +211,15 @@ if __name__ == "__main__":
             "Generalo con: openssl rand -hex 32"
         )
     # Escucha SOLO en localhost; lo expone el túnel con HTTPS.
+    # stateless + JSON plano: cada request es autocontenida (sin session
+    # affinity) y las respuestas a POST son application/json en vez de SSE —
+    # el modo más compatible con el conector personalizado de claude.ai.
     # La URL final del conector es: https://<tu-hostname>/<MCP_SECRET>/mcp
-    mcp.run(transport="http", host="127.0.0.1", port=PORT, path=f"/{SECRET}/mcp")
+    mcp.run(
+        transport="http",
+        host="127.0.0.1",
+        port=PORT,
+        path=f"/{SECRET}/mcp",
+        stateless_http=True,
+        json_response=True,
+    )
